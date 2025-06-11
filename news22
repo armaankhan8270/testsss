@@ -1,0 +1,329 @@
+import os
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Dict, Any, List
+import logging
+from datetime import datetime
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class DataExtractor:
+    """Fast, parallel data extraction and Snowflake loading utility"""
+    
+    # Configuration constants
+    BATCH_SIZE = 50000
+    MAX_WORKERS = 4
+    CHUNK_SIZE = 10000
+    
+    def __init__(self, source_cursor, target_cursor):
+        self.source_cursor = source_cursor
+        self.target_cursor = target_cursor
+        self.base_dir = Path("data_extracts")
+        self.base_dir.mkdir(exist_ok=True)
+    
+    def extract_table(self, 
+                     source_table: str, 
+                     target_table: str, 
+                     stage_name: str,
+                     sql_file: Optional[str] = None,
+                     file_format: str = 'parquet',
+                     parallel: bool = True) -> Dict[str, Any]:
+        """
+        Extract data from source and prepare for Snowflake upload
+        
+        Args:
+            source_table: Source table (db.schema.table)
+            target_table: Target table (db.schema.table) 
+            stage_name: Snowflake stage name
+            sql_file: Optional SQL file path for custom queries
+            file_format: 'csv' or 'parquet'
+            parallel: Enable parallel processing
+        """
+        try:
+            start_time = datetime.now()
+            logger.info(f"Starting extraction: {source_table} -> {target_table}")
+            
+            # Create directory structure
+            table_dir = self._create_table_dir(target_table)
+            
+            # Get query and row count
+            query = self._get_query(source_table, sql_file)
+            total_rows = self._get_row_count(source_table, sql_file)
+            
+            if total_rows == 0:
+                logger.warning(f"No data found in {source_table}")
+                return {"status": "empty", "files": [], "rows": 0}
+            
+            # Extract data
+            files = self._extract_batches(query, table_dir, file_format, total_rows, parallel)
+            
+            # Upload to Snowflake
+            upload_result = self._upload_to_snowflake(files, stage_name, target_table)
+            
+            duration = (datetime.now() - start_time).total_seconds()
+            
+            return {
+                "status": "success",
+                "files": files,
+                "rows": total_rows,
+                "duration": duration,
+                "upload_result": upload_result
+            }
+            
+        except Exception as e:
+            logger.error(f"Extraction failed: {str(e)}")
+            return {"status": "error", "error": str(e)}
+    
+    def _create_table_dir(self, target_table: str) -> Path:
+        """Create directory structure: db/schema/table"""
+        parts = target_table.split('.')
+        if len(parts) != 3:
+            raise ValueError("Target table must be in format: db.schema.table")
+        
+        table_dir = self.base_dir / parts[0] / parts[1] / parts[2]
+        table_dir.mkdir(parents=True, exist_ok=True)
+        return table_dir
+    
+    def _get_query(self, source_table: str, sql_file: Optional[str]) -> str:
+        """Get extraction query from SQL file or generate SELECT statement"""
+        if sql_file and Path(sql_file).exists():
+            with open(sql_file, 'r') as f:
+                return f.read().strip()
+        return f"SELECT * FROM {source_table}"
+    
+    def _get_row_count(self, source_table: str, sql_file: Optional[str]) -> int:
+        """Get total row count for progress tracking"""
+        try:
+            if sql_file and Path(sql_file).exists():
+                with open(sql_file, 'r') as f:
+                    query = f.read().strip()
+                count_query = f"SELECT COUNT(*) FROM ({query}) AS subquery"
+            else:
+                count_query = f"SELECT COUNT(*) FROM {source_table}"
+            
+            self.source_cursor.execute(count_query)
+            return self.source_cursor.fetchone()[0]
+        except Exception as e:
+            logger.warning(f"Could not get row count: {e}")
+            return 0
+    
+    def _extract_batches(self, query: str, table_dir: Path, file_format: str, 
+                        total_rows: int, parallel: bool) -> List[str]:
+        """Extract data in batches with optional parallel processing"""
+        
+        if not parallel or total_rows < self.BATCH_SIZE * 2:
+            return self._extract_sequential(query, table_dir, file_format)
+        
+        return self._extract_parallel(query, table_dir, file_format, total_rows)
+    
+    def _extract_sequential(self, query: str, table_dir: Path, file_format: str) -> List[str]:
+        """Sequential batch extraction"""
+        files = []
+        batch_num = 1
+        
+        try:
+            self.source_cursor.execute(query)
+            
+            while True:
+                rows = self.source_cursor.fetchmany(self.BATCH_SIZE)
+                if not rows:
+                    break
+                
+                # Get column names
+                columns = [desc[0] for desc in self.source_cursor.description]
+                df = pd.DataFrame(rows, columns=columns)
+                
+                # Save batch
+                filename = self._save_batch(df, table_dir, batch_num, file_format)
+                files.append(filename)
+                
+                logger.info(f"Extracted batch {batch_num}: {len(df)} rows")
+                batch_num += 1
+                
+        except Exception as e:
+            logger.error(f"Sequential extraction error: {e}")
+            raise
+        
+        return files
+    
+    def _extract_parallel(self, query: str, table_dir: Path, file_format: str, total_rows: int) -> List[str]:
+        """Parallel batch extraction using LIMIT/OFFSET"""
+        files = []
+        batches = [(i, min(self.BATCH_SIZE, total_rows - i)) 
+                  for i in range(0, total_rows, self.BATCH_SIZE)]
+        
+        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
+            # Submit all batch jobs
+            future_to_batch = {
+                executor.submit(self._extract_batch_chunk, query, table_dir, 
+                              file_format, offset, size, batch_num + 1): batch_num
+                for batch_num, (offset, size) in enumerate(batches)
+            }
+            
+            # Collect results
+            for future in as_completed(future_to_batch):
+                try:
+                    filename = future.result()
+                    if filename:
+                        files.append(filename)
+                except Exception as e:
+                    logger.error(f"Batch extraction error: {e}")
+        
+        return sorted(files)
+    
+    def _extract_batch_chunk(self, query: str, table_dir: Path, file_format: str,
+                           offset: int, size: int, batch_num: int) -> Optional[str]:
+        """Extract a single batch chunk"""
+        try:
+            # Create new cursor for thread safety
+            batch_query = f"{query} LIMIT {size} OFFSET {offset}"
+            
+            # Execute query
+            self.source_cursor.execute(batch_query)
+            rows = self.source_cursor.fetchall()
+            
+            if not rows:
+                return None
+            
+            # Get column names
+            columns = [desc[0] for desc in self.source_cursor.description]
+            df = pd.DataFrame(rows, columns=columns)
+            
+            # Save batch
+            filename = self._save_batch(df, table_dir, batch_num, file_format)
+            logger.info(f"Extracted batch {batch_num}: {len(df)} rows")
+            
+            return filename
+            
+        except Exception as e:
+            logger.error(f"Batch chunk error: {e}")
+            return None
+    
+    def _save_batch(self, df: pd.DataFrame, table_dir: Path, batch_num: int, file_format: str) -> str:
+        """Save DataFrame to file with optimal settings"""
+        filename = f"batch_{batch_num:04d}.{file_format}"
+        filepath = table_dir / filename
+        
+        try:
+            if file_format.lower() == 'csv':
+                df.to_csv(filepath, index=False, chunksize=self.CHUNK_SIZE)
+            else:  # parquet
+                # Optimize parquet settings
+                table = pa.Table.from_pandas(df)
+                pq.write_table(table, filepath, compression='snappy', 
+                             row_group_size=self.CHUNK_SIZE)
+            
+            return str(filepath)
+            
+        except Exception as e:
+            logger.error(f"Save batch error: {e}")
+            raise
+    
+    def _upload_to_snowflake(self, files: List[str], stage_name: str, target_table: str) -> Dict[str, Any]:
+        """Upload files to Snowflake stage and load to table"""
+        try:
+            results = {"put_results": [], "copy_results": []}
+            
+            # Upload files to stage
+            for file_path in files:
+                put_cmd = f"PUT file://{file_path} @{stage_name} AUTO_COMPRESS=TRUE OVERWRITE=TRUE"
+                self.target_cursor.execute(put_cmd)
+                results["put_results"].append(self.target_cursor.fetchall())
+            
+            # Copy to target table
+            file_pattern = f"@{stage_name}/batch_*.{files[0].split('.')[-1]}.gz"
+            
+            if files[0].endswith('.csv'):
+                copy_cmd = f"""
+                COPY INTO {target_table}
+                FROM {file_pattern}
+                FILE_FORMAT = (TYPE = 'CSV' FIELD_DELIMITER = ',' SKIP_HEADER = 1)
+                ON_ERROR = 'CONTINUE'
+                """
+            else:  # parquet
+                copy_cmd = f"""
+                COPY INTO {target_table}
+                FROM {file_pattern}
+                FILE_FORMAT = (TYPE = 'PARQUET')
+                MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+                ON_ERROR = 'CONTINUE'
+                """
+            
+            self.target_cursor.execute(copy_cmd)
+            results["copy_results"] = self.target_cursor.fetchall()
+            
+            logger.info(f"Successfully uploaded {len(files)} files to {target_table}")
+            return results
+            
+        except Exception as e:
+            logger.error(f"Snowflake upload error: {e}")
+            raise
+    
+    def extract_multiple_tables(self, table_configs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Extract multiple tables with parallel processing"""
+        results = {}
+        
+        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
+            future_to_table = {
+                executor.submit(
+                    self.extract_table,
+                    config['source_table'],
+                    config['target_table'], 
+                    config['stage_name'],
+                    config.get('sql_file'),
+                    config.get('file_format', 'parquet'),
+                    config.get('parallel', True)
+                ): config['target_table']
+                for config in table_configs
+            }
+            
+            for future in as_completed(future_to_table):
+                table_name = future_to_table[future]
+                try:
+                    results[table_name] = future.result()
+                except Exception as e:
+                    results[table_name] = {"status": "error", "error": str(e)}
+        
+        return results
+
+
+# Usage Example
+if __name__ == "__main__":
+    # Example usage (you provide the cursors)
+    # source_cursor = your_source_db_cursor
+    # target_cursor = your_snowflake_cursor
+    
+    # extractor = DataExtractor(source_cursor, target_cursor)
+    
+    # Single table extraction
+    # result = extractor.extract_table(
+    #     source_table="prod.sales.orders",
+    #     target_table="warehouse.dim.orders", 
+    #     stage_name="my_stage",
+    #     file_format="parquet"
+    # )
+    
+    # Multiple tables
+    # configs = [
+    #     {
+    #         "source_table": "prod.sales.orders",
+    #         "target_table": "warehouse.dim.orders",
+    #         "stage_name": "my_stage",
+    #         "file_format": "parquet"
+    #     },
+    #     {
+    #         "source_table": "prod.sales.customers", 
+    #         "target_table": "warehouse.dim.customers",
+    #         "stage_name": "my_stage",
+    #         "sql_file": "custom_customer_query.sql"
+    #     }
+    # ]
+    # results = extractor.extract_multiple_tables(configs)
+    
+    pass
