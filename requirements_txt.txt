@@ -1,0 +1,40 @@
+# PolarSled Data Extraction System - Python Dependencies
+
+# Core dependencies
+pandas>=2.0.0
+numpy>=1.24.0
+click>=8.0.0
+pyyaml>=6.0
+
+# File format support
+pyarrow>=12.0.0          # For Parquet files
+openpyxl>=3.1.0          # For Excel files (optional)
+
+# Database connectors
+google-cloud-bigquery>=3.11.0    # BigQuery
+google-auth>=2.17.0              # Google authentication
+pyodbc>=4.0.39                   # SQL Server
+cx-Oracle>=8.3.0                 # Oracle (optional)
+snowflake-connector-python>=3.0.0  # Snowflake
+
+# Performance and utilities
+tqdm>=4.65.0             # Progress bars
+psutil>=5.9.0            # System monitoring
+python-dotenv>=1.0.0     # Environment variables
+
+# Development and testing (optional)
+pytest>=7.0.0
+pytest-cov>=4.0.0
+black>=23.0.0
+flake8>=6.0.0
+
+# Logging and monitoring
+structlog>=23.0.0        # Structured logging (optional)
+
+# Data validation (if needed)
+great-expectations>=0.17.0  # Data quality (optional)
+
+# Note: Some packages may require additional system dependencies
+# For Oracle: Oracle Instant Client
+# For SQL Server: ODBC Driver 17 for SQL Server
+# For BigQuery: Service account JSON file

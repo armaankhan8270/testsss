@@ -1,0 +1,71 @@
+@echo off
+REM PolarSled Data Extraction Tool - Windows Launcher
+REM Place this file in your project root directory
+
+setlocal EnableDelayedExpansion
+
+REM Set script directory
+set SCRIPT_DIR=%~dp0
+cd /d "%SCRIPT_DIR%"
+
+REM Check if Python is available
+python --version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo ❌ Error: Python is not installed or not in PATH
+    echo Please install Python 3.7+ and try again
+    pause
+    exit /b 1
+)
+
+REM Check if main script exists
+if not exist "polarsled_extract.py" (
+    echo ❌ Error: polarsled_extract.py not found in current directory
+    echo Please ensure you're running this from the correct directory
+    pause
+    exit /b 1
+)
+
+REM Create virtual environment if it doesn't exist
+if not exist "venv\" (
+    echo 🚀 Creating Python virtual environment...
+    python -m venv venv
+    if %errorlevel% neq 0 (
+        echo ❌ Failed to create virtual environment
+        pause
+        exit /b 1
+    )
+)
+
+REM Activate virtual environment
+echo 🔄 Activating virtual environment...
+call venv\Scripts\activate.bat
+
+REM Install/upgrade requirements if requirements.txt exists
+if exist "requirements.txt" (
+    echo 📦 Installing/updating dependencies...
+    pip install -r requirements.txt --quiet
+)
+
+REM Run the extraction tool with all passed arguments
+echo 🚀 Starting PolarSled Data Extraction...
+echo ================================================
+python polarsled_extract.py %*
+
+REM Check exit code
+if %errorlevel% equ 0 (
+    echo.
+    echo ✅ Extraction completed successfully!
+    echo 📁 Check the 'extracted_data' folder for results
+    echo 📋 Check the 'logging' folder for detailed logs
+) else (
+    echo.
+    echo ❌ Extraction failed with error code: %errorlevel%
+    echo 📋 Check the log files for detailed error information
+)
+
+echo.
+echo Press any key to exit...
+pause >nul
+
+REM Deactivate virtual environment
+deactivate

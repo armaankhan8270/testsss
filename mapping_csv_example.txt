@@ -1,0 +1,6 @@
+extraction_id,source_name,source_type,target_name,target_type,stage_name,sql_file_path,where_clause,exclude_columns,custom_sql
+1,lti-coe.sample_coe.EMPLOYEES,table,POLARSLED_DB.HR.EMPLOYEES,table,HR_STAGE,,SALARY>50000,"ssn,personal_notes",
+2,lti-coe.analytics.SALES_DATA,table,POLARSLED_DB.SALES.MONTHLY_SALES,table,SALES_STAGE,,DATE >= '2024-01-01',"internal_comments,temp_fields",
+3,corporate_db.finance.TRANSACTIONS,table,POLARSLED_DB.FINANCE.DAILY_TRANSACTIONS,table,FINANCE_STAGE,/queries/transaction_extract.sql,,credit_card_full,
+4,production.logs.APPLICATION_LOGS,table,POLARSLED_DB.LOGS.APP_LOGS,table,LOG_STAGE,,severity IN ('ERROR','FATAL'),"user_session_data,ip_addresses",SELECT log_id\, message\, timestamp FROM production.logs.APPLICATION_LOGS WHERE created_date >= CURRENT_DATE - 7
+5,warehouse.inventory.STOCK_LEVELS,table,POLARSLED_DB.INVENTORY.CURRENT_STOCK,table,INVENTORY_STAGE,/queries/stock_with_suppliers.sql,quantity > 0,,
